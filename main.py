@@ -1,6 +1,6 @@
 """
 MarketSentinel — Backend FastAPI
-Proxy FRED + invio alert Telegram
+Proxy FRED + Telegram alerts + NewsAPI fetch
 """
 
 import asyncio
@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="MarketSentinel API", version="2.0.0")
+app = FastAPI(title="MarketSentinel API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,8 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+FRED_BASE     = "https://api.stlouisfed.org/fred/series/observations"
 TELEGRAM_BASE = "https://api.telegram.org"
+NEWS_BASE     = "https://newsapi.org/v2/everything"
 
 # ─── FRED ─────────────────────────────────────────────────────────────────────
 async def fred_get(client, series_id, key, limit=13):
@@ -40,11 +41,11 @@ def score_unemp(v): return 70 if v>6 else 55 if v>5 else 40 if v>4.5 else 20
 async def fred_data(api_key: str = Query(...)):
     async with httpx.AsyncClient() as client:
         cpi, fed, sentiment_obs, yld, unemp = await asyncio.gather(
-            fred_get(client, "CPIAUCSL",  api_key, 13),
-            fred_get(client, "FEDFUNDS",  api_key, 1),
-            fred_get(client, "UMCSENT",   api_key, 1),
-            fred_get(client, "T10Y2Y",    api_key, 1),
-            fred_get(client, "UNRATE",    api_key, 1),
+            fred_get(client, "CPIAUCSL", api_key, 13),
+            fred_get(client, "FEDFUNDS", api_key, 1),
+            fred_get(client, "UMCSENT",  api_key, 1),
+            fred_get(client, "T10Y2Y",   api_key, 1),
+            fred_get(client, "UNRATE",   api_key, 1),
         )
     cpi_now = float(cpi[0]["value"])
     cpi_ago = float(cpi[min(12, len(cpi)-1)]["value"])
@@ -60,12 +61,70 @@ async def fred_data(api_key: str = Query(...)):
     return {
         "macro_score": macro_score,
         "signals": [
-            {"name":"CPI YoY (US)",       "val":f"{cpi_yoy}%",  "score":s1, "badge":badge(s1), "label":"CRITICO" if cpi_yoy>4 else "SOPRA TARGET" if cpi_yoy>3 else "MODERATO" if cpi_yoy>2 else "TARGET"},
-            {"name":"Fed Funds Rate",     "val":f"{fed_r}%",    "score":s2, "badge":badge(s2), "label":"MOLTO RESTR." if fed_r>5 else "RESTRITTIVO" if fed_r>4 else "NEUTRO"},
-            {"name":"Consumer Sentiment", "val":str(sent_v),    "score":s3, "badge":badge(s3), "label":"PESSIMISMO" if sent_v<60 else "CAUTELA" if sent_v<75 else "NEUTRO" if sent_v<90 else "OTTIMISMO"},
-            {"name":"Yield 10Y−2Y",      "val":f"{yld_v:+}%",  "score":s4, "badge":badge(s4), "label":"INVERSIONE" if yld_v<-0.2 else "PIATTA" if yld_v<0 else "NORMALE"},
-            {"name":"Disoccupazione",     "val":f"{unemp_v}%",  "score":s5, "badge":badge(s5), "label":"IN AUMENTO" if unemp_v>5 else "SOLIDA"},
+            {"name":"CPI YoY (US)",       "val":f"{cpi_yoy}%", "score":s1, "badge":badge(s1), "label":"CRITICO" if cpi_yoy>4 else "SOPRA TARGET" if cpi_yoy>3 else "MODERATO" if cpi_yoy>2 else "TARGET"},
+            {"name":"Fed Funds Rate",     "val":f"{fed_r}%",   "score":s2, "badge":badge(s2), "label":"MOLTO RESTR." if fed_r>5 else "RESTRITTIVO" if fed_r>4 else "NEUTRO"},
+            {"name":"Consumer Sentiment", "val":str(sent_v),   "score":s3, "badge":badge(s3), "label":"PESSIMISMO" if sent_v<60 else "CAUTELA" if sent_v<75 else "NEUTRO" if sent_v<90 else "OTTIMISMO"},
+            {"name":"Yield 10Y−2Y",      "val":f"{yld_v:+}%", "score":s4, "badge":badge(s4), "label":"INVERSIONE" if yld_v<-0.2 else "PIATTA" if yld_v<0 else "NORMALE"},
+            {"name":"Disoccupazione",     "val":f"{unemp_v}%", "score":s5, "badge":badge(s5), "label":"IN AUMENTO" if unemp_v>5 else "SOLIDA"},
         ]
+    }
+
+# ─── NEWS API ─────────────────────────────────────────────────────────────────
+NEWS_QUERIES = [
+    "S&P500 stock market",
+    "Federal Reserve interest rates",
+    "geopolitical risk economy",
+    "inflation recession GDP",
+]
+
+@app.get("/api/news")
+async def get_news(api_key: str = Query(...)):
+    """
+    Recupera le ultime notizie finanziarie da NewsAPI su 4 topic,
+    le deduplicata e restituisce un testo aggregato pronto per l'analisi AI.
+    """
+    headlines = []
+    seen_titles = set()
+
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        for query in NEWS_QUERIES:
+            url = (
+                f"{NEWS_BASE}?q={query}&language=en&sortBy=publishedAt"
+                f"&pageSize=5&apiKey={api_key}"
+            )
+            tasks.append(client.get(url, timeout=15))
+
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for resp in responses:
+        if isinstance(resp, Exception):
+            continue
+        try:
+            data = resp.json()
+            if data.get("status") != "ok":
+                continue
+            for article in data.get("articles", []):
+                title = article.get("title", "").strip()
+                desc  = article.get("description", "").strip()
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                if desc:
+                    headlines.append(f"• {title}: {desc}")
+                else:
+                    headlines.append(f"• {title}")
+        except Exception:
+            continue
+
+    if not headlines:
+        raise HTTPException(404, "Nessuna notizia trovata. Verifica la API key NewsAPI.")
+
+    # Testo aggregato — max 30 headlines per non superare i token Claude
+    news_text = "\n".join(headlines[:30])
+    return {
+        "count": len(headlines[:30]),
+        "text": news_text,
     }
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -76,7 +135,7 @@ class AlertPayload(BaseModel):
     tech_score: int
     macro_score: int
     sent_score: int
-    trigger: str  # "threshold" | "refresh"
+    trigger: str
     top_signals: list[str] = []
 
 def risk_emoji(score: int) -> str:
@@ -87,7 +146,6 @@ def risk_emoji(score: int) -> str:
 def build_message(p: AlertPayload) -> str:
     emoji = risk_emoji(p.overall_score)
     trigger_label = "⚠️ SOGLIA SUPERATA" if p.trigger == "threshold" else "🔄 Aggiornamento dati"
-
     lines = [
         f"{emoji} *MarketSentinel Alert*",
         f"_{trigger_label}_",
@@ -98,20 +156,17 @@ def build_message(p: AlertPayload) -> str:
         f"• Macro:     {p.macro_score}",
         f"• Sentiment: {p.sent_score}",
     ]
-
     if p.top_signals:
         lines.append("")
         lines.append("*Segnali critici:*")
         for s in p.top_signals[:3]:
             lines.append(f"  ↳ {s}")
-
     if p.overall_score >= 75:
         lines += ["", "🚨 *Valutare riduzione esposizione azionaria*"]
     elif p.overall_score >= 60:
         lines += ["", "⚡ *Monitorare attentamente l'evoluzione*"]
     else:
         lines += ["", "✅ *Mercato stabile — nessuna azione richiesta*"]
-
     return "\n".join(lines)
 
 @app.post("/api/send-alert")
@@ -126,7 +181,7 @@ async def send_alert(payload: AlertPayload):
         }, timeout=10)
     data = r.json()
     if not data.get("ok"):
-        raise HTTPException(400, f"Telegram error: {data.get('description','Unknown error')}")
+        raise HTTPException(400, f"Telegram error: {data.get('description','Unknown')}")
     return {"sent": True, "message_id": data["result"]["message_id"]}
 
 @app.get("/health")
