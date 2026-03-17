@@ -1,15 +1,16 @@
 """
-MarketSentinel — Backend FastAPI
-Proxy FRED + Telegram alerts + NewsAPI fetch
+MarketSentinel — Backend FastAPI v4
+Proxy FRED + Telegram + NewsAPI + Claude Sentiment
 """
 
 import asyncio
+import os
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="MarketSentinel API", version="3.0.0")
+app = FastAPI(title="MarketSentinel API", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,9 +18,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRED_BASE     = "https://api.stlouisfed.org/fred/series/observations"
-TELEGRAM_BASE = "https://api.telegram.org"
-NEWS_BASE     = "https://newsapi.org/v2/everything"
+FRED_BASE      = "https://api.stlouisfed.org/fred/series/observations"
+TELEGRAM_BASE  = "https://api.telegram.org"
+NEWS_BASE      = "https://newsapi.org/v2/everything"
+ANTHROPIC_BASE = "https://api.anthropic.com/v1/messages"
 
 # ─── FRED ─────────────────────────────────────────────────────────────────────
 async def fred_get(client, series_id, key, limit=13):
@@ -79,22 +81,14 @@ NEWS_QUERIES = [
 
 @app.get("/api/news")
 async def get_news(api_key: str = Query(...)):
-    """
-    Recupera le ultime notizie finanziarie da NewsAPI su 4 topic,
-    le deduplicata e restituisce un testo aggregato pronto per l'analisi AI.
-    """
     headlines = []
     seen_titles = set()
 
     async with httpx.AsyncClient() as client:
-        tasks = []
-        for query in NEWS_QUERIES:
-            url = (
-                f"{NEWS_BASE}?q={query}&language=en&sortBy=publishedAt"
-                f"&pageSize=5&apiKey={api_key}"
-            )
-            tasks.append(client.get(url, timeout=15))
-
+        tasks = [
+            client.get(f"{NEWS_BASE}?q={q}&language=en&sortBy=publishedAt&pageSize=5&apiKey={api_key}", timeout=15)
+            for q in NEWS_QUERIES
+        ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     for resp in responses:
@@ -110,22 +104,55 @@ async def get_news(api_key: str = Query(...)):
                 if not title or title in seen_titles:
                     continue
                 seen_titles.add(title)
-                if desc:
-                    headlines.append(f"• {title}: {desc}")
-                else:
-                    headlines.append(f"• {title}")
+                headlines.append(f"• {title}: {desc}" if desc else f"• {title}")
         except Exception:
             continue
 
     if not headlines:
         raise HTTPException(404, "Nessuna notizia trovata. Verifica la API key NewsAPI.")
 
-    # Testo aggregato — max 30 headlines per non superare i token Claude
     news_text = "\n".join(headlines[:30])
-    return {
-        "count": len(headlines[:30]),
-        "text": news_text,
-    }
+    return {"count": len(headlines[:30]), "text": news_text}
+
+# ─── SENTIMENT (Claude via backend) ───────────────────────────────────────────
+class SentimentPayload(BaseModel):
+    text: str
+
+@app.post("/api/sentiment")
+async def analyze_sentiment(payload: SentimentPayload):
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        raise HTTPException(500, "ANTHROPIC_API_KEY non configurata nel backend")
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            ANTHROPIC_BASE,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "system": """Analista finanziario quantitativo. Restituisci SOLO JSON valido, nessun testo extra:
+{"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}""",
+                "messages": [{"role": "user", "content": f"Analizza queste notizie:\n\n{payload.text}"}],
+            },
+            timeout=30,
+        )
+
+    if not r.is_success:
+        raise HTTPException(r.status_code, f"Errore Claude API: {r.text[:200]}")
+
+    data = r.json()
+    raw = "".join(b.get("text", "") for b in data.get("content", []))
+    try:
+        import json
+        result = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        return result
+    except Exception:
+        raise HTTPException(500, "Errore nel parsing della risposta Claude")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 class AlertPayload(BaseModel):
@@ -138,29 +165,20 @@ class AlertPayload(BaseModel):
     trigger: str
     top_signals: list[str] = []
 
-def risk_emoji(score: int) -> str:
-    if score >= 75: return "🔴"
-    if score >= 60: return "🟡"
-    return "🟢"
+def risk_emoji(score): return "🔴" if score>=75 else "🟡" if score>=60 else "🟢"
 
-def build_message(p: AlertPayload) -> str:
+def build_message(p):
     emoji = risk_emoji(p.overall_score)
-    trigger_label = "⚠️ SOGLIA SUPERATA" if p.trigger == "threshold" else "🔄 Aggiornamento dati"
+    trigger_label = "⚠️ SOGLIA SUPERATA" if p.trigger=="threshold" else "🔄 Aggiornamento dati"
     lines = [
-        f"{emoji} *MarketSentinel Alert*",
-        f"_{trigger_label}_",
-        "",
-        f"*Risk Score: {p.overall_score}/100*",
-        "",
+        f"{emoji} *MarketSentinel Alert*", f"_{trigger_label}_", "",
+        f"*Risk Score: {p.overall_score}/100*", "",
         f"• Tecnico:   {p.tech_score}",
         f"• Macro:     {p.macro_score}",
         f"• Sentiment: {p.sent_score}",
     ]
     if p.top_signals:
-        lines.append("")
-        lines.append("*Segnali critici:*")
-        for s in p.top_signals[:3]:
-            lines.append(f"  ↳ {s}")
+        lines += ["", "*Segnali critici:*"] + [f"  ↳ {s}" for s in p.top_signals[:3]]
     if p.overall_score >= 75:
         lines += ["", "🚨 *Valutare riduzione esposizione azionaria*"]
     elif p.overall_score >= 60:
@@ -172,13 +190,12 @@ def build_message(p: AlertPayload) -> str:
 @app.post("/api/send-alert")
 async def send_alert(payload: AlertPayload):
     message = build_message(payload)
-    url = f"{TELEGRAM_BASE}/bot{payload.bot_token}/sendMessage"
     async with httpx.AsyncClient() as client:
-        r = await client.post(url, json={
-            "chat_id": payload.chat_id,
-            "text": message,
-            "parse_mode": "Markdown",
-        }, timeout=10)
+        r = await client.post(
+            f"{TELEGRAM_BASE}/bot{payload.bot_token}/sendMessage",
+            json={"chat_id": payload.chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=10,
+        )
     data = r.json()
     if not data.get("ok"):
         raise HTTPException(400, f"Telegram error: {data.get('description','Unknown')}")
