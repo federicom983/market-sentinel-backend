@@ -143,7 +143,7 @@ async def analyze_sentiment(payload: SentimentPayload):
         )
 
     if not r.is_success:
-        raise HTTPException(r.status_code, f"Errore Claude API: {r.text[:200]}")
+        print(f"Claude error: {r.status_code} - {r.text}"); raise HTTPException(r.status_code, f"Errore Claude API: {r.text[:200]}")
 
     data = r.json()
     raw = "".join(b.get("text", "") for b in data.get("content", []))
