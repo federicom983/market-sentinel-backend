@@ -133,7 +133,7 @@ async def analyze_sentiment(payload: SentimentPayload):
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 1000,
                 "system": """Analista finanziario quantitativo. Restituisci SOLO JSON valido, nessun testo extra:
 {"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}""",
