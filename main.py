@@ -21,7 +21,7 @@ app.add_middleware(
 FRED_BASE      = "https://api.stlouisfed.org/fred/series/observations"
 TELEGRAM_BASE  = "https://api.telegram.org"
 NEWS_BASE      = "https://newsapi.org/v2/everything"
-ANTHROPIC_BASE = "https://api.anthropic.com/v1/messages"
+GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
 
 # ─── FRED ─────────────────────────────────────────────────────────────────────
 async def fred_get(client, series_id, key, limit=13):
@@ -114,45 +114,53 @@ async def get_news(api_key: str = Query(...)):
     news_text = "\n".join(headlines[:30])
     return {"count": len(headlines[:30]), "text": news_text}
 
-# ─── SENTIMENT (Claude via backend) ───────────────────────────────────────────
+# ─── SENTIMENT (Groq via backend) ────────────────────────────────────────────
+GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
+
 class SentimentPayload(BaseModel):
     text: str
 
 @app.post("/api/sentiment")
 async def analyze_sentiment(payload: SentimentPayload):
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not anthropic_key:
-        raise HTTPException(500, "ANTHROPIC_API_KEY non configurata nel backend")
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        raise HTTPException(500, "GROQ_API_KEY non configurata nel backend")
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            ANTHROPIC_BASE,
+            GROQ_BASE,
             headers={
                 "Content-Type": "application/json",
-                "x-api-key": anthropic_key,
-                "anthropic-version": "2023-06-01",
+                "Authorization": f"Bearer {groq_key}",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "llama-3.3-70b-versatile",
                 "max_tokens": 1000,
-                "system": """Analista finanziario quantitativo. Restituisci SOLO JSON valido, nessun testo extra:
-{"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}""",
-                "messages": [{"role": "user", "content": f"Analizza queste notizie:\n\n{payload.text}"}],
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """Sei un analista finanziario quantitativo. Restituisci SOLO JSON valido, nessun testo extra:
+{"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}"""
+                    },
+                    {"role": "user", "content": f"Analizza queste notizie:\n\n{payload.text}"},
+                ],
             },
             timeout=30,
         )
 
     if not r.is_success:
-        raise HTTPException(r.status_code, f"Errore Claude API: {r.text[:200]}")
+        print(f"Groq error: {r.status_code} - {r.text}")
+        raise HTTPException(r.status_code, f"Errore Groq API: {r.text[:200]}")
 
     data = r.json()
-    raw = "".join(b.get("text", "") for b in data.get("content", []))
+    raw = data["choices"][0]["message"]["content"]
     try:
         import json
         result = json.loads(raw.replace("```json", "").replace("```", "").strip())
         return result
     except Exception:
-        raise HTTPException(500, "Errore nel parsing della risposta Claude")
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Errore parsing risposta: {raw[:200]}")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 class AlertPayload(BaseModel):
