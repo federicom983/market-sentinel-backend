@@ -139,7 +139,16 @@ async def analyze_sentiment(payload: SentimentPayload):
                 "messages": [
                     {
                         "role": "system",
-                        "content": """Sei un analista finanziario quantitativo. Restituisci SOLO JSON valido, nessun testo extra:
+                        "content": """Sei un analista finanziario quantitativo specializzato in risk management.
+Analizza le notizie e assegna un sentiment_score dove:
+- 0-30 = notizie positive o neutre, mercati tranquilli, nessun rischio di correzione
+- 31-55 = notizie miste, qualche preoccupazione ma niente di grave
+- 56-75 = notizie negative, rischio correzione possibile, segnali di allerta
+- 76-100 = notizie molto negative, rischio correzione imminente, segnali critici
+
+Esempi: "mercati in rialzo, economia solida" → score 15. "Fed alza tassi, inflazione alta, tensioni geopolitiche" → score 72. "crash mercati, recessione, guerra" → score 92.
+
+Restituisci SOLO JSON valido, nessun testo extra:
 {"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}"""
                     },
                     {"role": "user", "content": f"Analizza queste notizie:\n\n{payload.text}"},
