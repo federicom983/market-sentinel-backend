@@ -133,7 +133,7 @@ async def analyze_sentiment(payload: SentimentPayload):
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-sonnet-4-5",
+                "model": "claude-sonnet-4-20250514",
                 "max_tokens": 1000,
                 "system": """Analista finanziario quantitativo. Restituisci SOLO JSON valido, nessun testo extra:
 {"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}""",
@@ -143,7 +143,7 @@ async def analyze_sentiment(payload: SentimentPayload):
         )
 
     if not r.is_success:
-        print(f"Claude error: {r.status_code} - {r.text}"); raise HTTPException(r.status_code, f"Errore Claude API: {r.text[:200]}")
+        raise HTTPException(r.status_code, f"Errore Claude API: {r.text[:200]}")
 
     data = r.json()
     raw = "".join(b.get("text", "") for b in data.get("content", []))
@@ -152,7 +152,7 @@ async def analyze_sentiment(payload: SentimentPayload):
         result = json.loads(raw.replace("```json", "").replace("```", "").strip())
         return result
     except Exception:
-        import traceback; traceback.print_exc(); raise HTTPException(500, "Errore nel parsing della risposta Claude")
+        raise HTTPException(500, "Errore nel parsing della risposta Claude")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 class AlertPayload(BaseModel):
