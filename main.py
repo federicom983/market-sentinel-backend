@@ -79,6 +79,14 @@ NEWS_QUERIES = [
     "inflation recession GDP",
 ]
 
+CONSULTING_QUERIES = [
+    "Goldman Sachs market outlook forecast",
+    "Morgan Stanley investment strategy",
+    "JPMorgan market view recession",
+    "BlackRock investment outlook",
+    "Citi UBS market forecast 2025",
+]
+
 @app.get("/api/news")
 async def get_news(api_key: str = Query(...)):
     headlines = []
@@ -113,6 +121,114 @@ async def get_news(api_key: str = Query(...)):
 
     news_text = "\n".join(headlines[:30])
     return {"count": len(headlines[:30]), "text": news_text}
+
+# ─── CONSULTING OPINIONS ──────────────────────────────────────────────────────
+@app.get("/api/consulting-news")
+async def get_consulting_news(api_key: str = Query(...)):
+    """
+    Recupera opinioni e previsioni delle principali banche d'investimento
+    tramite NewsAPI e le restituisce come testo aggregato per l'analisi AI.
+    """
+    headlines = []
+    seen_titles = set()
+
+    async with httpx.AsyncClient() as client:
+        tasks = [
+            client.get(f"{NEWS_BASE}?q={q}&language=en&sortBy=publishedAt&pageSize=4&apiKey={api_key}", timeout=15)
+            for q in CONSULTING_QUERIES
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for resp in responses:
+        if isinstance(resp, Exception):
+            continue
+        try:
+            data = resp.json()
+            if data.get("status") != "ok":
+                continue
+            for article in data.get("articles", []):
+                title = article.get("title", "").strip()
+                desc  = article.get("description", "").strip()
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                headlines.append(f"• {title}: {desc}" if desc else f"• {title}")
+        except Exception:
+            continue
+
+    if not headlines:
+        raise HTTPException(404, "Nessuna opinione trovata. Verifica la API key NewsAPI.")
+
+    news_text = "\n".join(headlines[:25])
+    return {"count": len(headlines[:25]), "text": news_text}
+
+class ConsultingPayload(BaseModel):
+    text: str
+
+@app.post("/api/consulting-sentiment")
+async def consulting_sentiment(payload: ConsultingPayload):
+    """
+    Analizza le opinioni delle banche d'investimento con Groq e restituisce
+    uno score 0-100 che rappresenta il pessimismo/ottimismo delle case di consulenza.
+    """
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if not groq_key:
+        raise HTTPException(500, "GROQ_API_KEY non configurata nel backend")
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            GROQ_BASE,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {groq_key}",
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "max_tokens": 800,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """Sei un analista che valuta le previsioni delle principali banche d'investimento.
+Analizza i titoli e assegna un consulting_score dove:
+- 0-30 = le banche sono ottimiste, prevedono mercati rialzisti, nessun rischio segnalato
+- 31-55 = previsioni miste, alcune cautele ma niente di grave
+- 56-75 = le banche sono caute/pessimiste, segnalano rischi significativi
+- 76-100 = le banche sono molto pessimiste, prevedono correzioni o recessione
+
+Esempi: "Goldman rialza target S&P500" → score 20. "JPMorgan avverte di rischi recessione" → score 68. "BlackRock riduce esposizione azionaria" → score 75.
+
+Restituisci SOLO JSON valido:
+{"consulting_score":<0-100>,"outlook":"<RIALZISTA|NEUTRO|RIBASSISTA|MOLTO_RIBASSISTA>","key_views":["view1","view2","view3"],"summary":"<2 frasi IT>"}"""
+                    },
+                    {"role": "user", "content": f"Analizza queste opinioni di banche d'investimento:\n\n{payload.text}"},
+                ],
+            },
+            timeout=30,
+        )
+
+    if not r.is_success:
+        print(f"Groq consulting error: {r.status_code} - {r.text}")
+        raise HTTPException(r.status_code, f"Errore Groq API: {r.text[:200]}")
+
+    data = r.json()
+    raw = data["choices"][0]["message"]["content"]
+    try:
+        import json
+        result = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        # Calcola outlook dal consulting_score
+        score = result.get("consulting_score", 50)
+        if score >= 76:
+            result["outlook"] = "MOLTO_RIBASSISTA"
+        elif score >= 56:
+            result["outlook"] = "RIBASSISTA"
+        elif score >= 31:
+            result["outlook"] = "NEUTRO"
+        else:
+            result["outlook"] = "RIALZISTA"
+        return result
+    except Exception:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, f"Errore parsing risposta: {raw[:200]}")
 
 # ─── SENTIMENT (Groq via backend) ────────────────────────────────────────────
 GROQ_BASE = "https://api.groq.com/openai/v1/chat/completions"
