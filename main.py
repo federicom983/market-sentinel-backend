@@ -152,7 +152,7 @@ async def analyze_sentiment(payload: SentimentPayload):
         result = json.loads(raw.replace("```json", "").replace("```", "").strip())
         return result
     except Exception:
-        raise HTTPException(500, "Errore nel parsing della risposta Claude")
+        import traceback; traceback.print_exc(); raise HTTPException(500, "Errore nel parsing della risposta Claude")
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 class AlertPayload(BaseModel):
