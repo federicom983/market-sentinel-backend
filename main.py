@@ -157,6 +157,16 @@ async def analyze_sentiment(payload: SentimentPayload):
     try:
         import json
         result = json.loads(raw.replace("```json", "").replace("```", "").strip())
+        # Calcola risk_level dal sentiment_score numerico — non ci fidiamo del modello
+        score = result.get("sentiment_score", 50)
+        if score >= 76:
+            result["risk_level"] = "CRITICO"
+        elif score >= 56:
+            result["risk_level"] = "ELEVATO"
+        elif score >= 31:
+            result["risk_level"] = "MEDIO"
+        else:
+            result["risk_level"] = "BASSO"
         return result
     except Exception:
         import traceback; traceback.print_exc()
