@@ -1,6 +1,6 @@
 """
-MarketSentinel — Backend FastAPI v5
-Proxy FRED (US + EU) + Telegram + NewsAPI + Groq Sentiment
+MarketSentinel — Backend FastAPI v6
+DCA/PAC Opportunity Scoring System
 """
 
 import asyncio
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="MarketSentinel API", version="5.0.0")
+app = FastAPI(title="MarketSentinel API", version="6.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,10 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRED_BASE      = "https://api.stlouisfed.org/fred/series/observations"
-TELEGRAM_BASE  = "https://api.telegram.org"
-NEWS_BASE      = "https://newsapi.org/v2/everything"
-GROQ_BASE      = "https://api.groq.com/openai/v1/chat/completions"
+FRED_BASE     = "https://api.stlouisfed.org/fred/series/observations"
+TELEGRAM_BASE = "https://api.telegram.org"
+NEWS_BASE     = "https://newsapi.org/v2/everything"
+GROQ_BASE     = "https://api.groq.com/openai/v1/chat/completions"
 
 # ─── FRED HELPERS ─────────────────────────────────────────────────────────────
 async def fred_get(client, series_id, key, limit=13):
@@ -34,72 +34,153 @@ async def fred_get(client, series_id, key, limit=13):
     return [o for o in data["observations"] if o["value"] != "."]
 
 async def fred_get_safe(client, series_id, key, limit=13):
-    """Versione che non solleva eccezioni — ritorna None se la serie non è disponibile."""
     try:
         return await fred_get(client, series_id, key, limit)
     except Exception:
         return None
 
-# ─── SCORING HELPERS ──────────────────────────────────────────────────────────
-def badge(s): return "red" if s >= 70 else "yellow" if s >= 50 else "green"
+def badge_opp(s):
+    """Badge per logica opportunità: alto score = buona opportunità."""
+    if s >= 70: return "green"
+    if s >= 45: return "yellow"
+    return "red"
 
-# US Macro scoring
-def score_cpi(v):       return 90 if v>6 else 75 if v>4 else 60 if v>3 else 40 if v>2 else 20
-def score_fed(v):       return 80 if v>5 else 65 if v>4 else 45 if v>2.5 else 25
-def score_consumer(v):  return 85 if v<60 else 65 if v<75 else 40 if v<90 else 20
-def score_yield(v):     return 90 if v<-0.5 else 75 if v<-0.2 else 60 if v<0 else 35 if v<0.5 else 20
-def score_unemp(v):     return 70 if v>6 else 55 if v>5 else 40 if v>4.5 else 20
+# ─── MACRO SCORING (logica DCA) ───────────────────────────────────────────────
+# Alto score = buona opportunità di ingresso (mercato depresso/tassi in calo)
 
-# EU Macro scoring
-def score_ecb(v):       return 80 if v>4 else 65 if v>3 else 45 if v>2 else 25
-def score_eu_cpi(v):    return 90 if v>6 else 75 if v>4 else 60 if v>3 else 40 if v>2 else 20
-def score_eurusd(v):
-    # EUR/USD basso (USD forte) = pressione su mercati europei ed EM
-    if v < 1.00: return 75
+def score_cpi_dca(v):
+    """CPI alta = Fed restrittiva = meno attrattivo per ingresso."""
+    if v > 6:  return 10
+    if v > 4:  return 25
+    if v > 3:  return 45
+    if v > 2:  return 65
+    return 80  # inflazione sotto controllo = ottimo per azionario
+
+def score_fed_dca(v):
+    """Tassi alti = mercato meno attrattivo, ma anche opportunità future."""
+    if v > 5:  return 30  # tassi molto alti = ancora restrittivo
+    if v > 4:  return 45
+    if v > 2.5: return 65
+    return 85  # tassi bassi = ottimo per azionario
+
+def score_consumer_dca(v):
+    """Consumer sentiment basso = pessimismo = opportunità contrarian."""
+    if v < 60:  return 85  # forte pessimismo = ottima opportunità
+    if v < 75:  return 70
+    if v < 90:  return 50
+    return 25   # euforia = mercato caro
+
+def score_yield_dca(v):
+    """Curva invertita = recessione attesa = potenziale ingresso anticipato."""
+    if v < -0.5: return 75  # forte inversione = paura = opportunità
+    if v < -0.2: return 65
+    if v < 0:    return 55
+    if v < 0.5:  return 45
+    return 35   # curva normale ripida = economia surriscaldata
+
+def score_unemp_dca(v):
+    """Disoccupazione in salita = mercato in sofferenza = potenziale opportunità."""
+    if v > 6:   return 70
+    if v > 5:   return 60
+    if v > 4.5: return 50
+    return 40   # piena occupazione = economia calda, meno upside
+
+def score_ecb_dca(v):
+    """BCE restrittiva = opportunità futura quando taglierà."""
+    if v > 4:  return 35
+    if v > 3:  return 50
+    if v > 2:  return 65
+    return 80
+
+def score_eu_cpi_dca(v):
+    if v > 6:  return 10
+    if v > 4:  return 25
+    if v > 3:  return 45
+    if v > 2:  return 65
+    return 80
+
+def score_eurusd_dca(v):
+    """EUR debole = EM e Europa più convenienti in USD."""
+    if v < 1.00: return 70
     if v < 1.05: return 60
-    if v < 1.10: return 45
-    return 25
+    if v < 1.10: return 50
+    return 40
 
-# ─── FRED DATA ENDPOINT ───────────────────────────────────────────────────────
+def score_dot_plot_dca(median_rate: float, current_rate: float) -> int:
+    """
+    Dot Plot: quanto la Fed prevede di tagliare rispetto ad oggi.
+    Più tagli attesi = maggiore opportunità per azionario.
+    """
+    expected_cuts = current_rate - median_rate  # positivo = tagli attesi
+    if expected_cuts > 1.5: return 90   # >150bp tagli attesi = molto positivo
+    if expected_cuts > 1.0: return 80
+    if expected_cuts > 0.5: return 70
+    if expected_cuts > 0.0: return 55   # qualche taglio atteso
+    if expected_cuts > -0.5: return 40  # invariato o piccolo rialzo
+    return 25                            # rialzi significativi attesi
+
+# ─── FRED ENDPOINT ────────────────────────────────────────────────────────────
 @app.get("/api/fred-data")
-async def fred_data(api_key: str = Query(...)):
+async def fred_data(
+    api_key: str = Query(...),
+    dot_plot_median: float = Query(default=None, description="Mediana Dot Plot Fed (es. 3.875)")
+):
     async with httpx.AsyncClient() as client:
-        # US + EU in parallelo
         (cpi, fed, consumer, yld, unemp,
          ecb, eu_cpi_obs, eurusd_obs) = await asyncio.gather(
-            fred_get(client, "CPIAUCSL",          api_key, 13),
-            fred_get(client, "FEDFUNDS",           api_key, 1),
-            fred_get(client, "UMCSENT",            api_key, 1),
-            fred_get(client, "T10Y2Y",             api_key, 1),
-            fred_get(client, "UNRATE",             api_key, 1),
-            fred_get_safe(client, "ECBDFR",        api_key, 1),
+            fred_get(client, "CPIAUCSL",            api_key, 13),
+            fred_get(client, "FEDFUNDS",             api_key, 1),
+            fred_get(client, "UMCSENT",              api_key, 1),
+            fred_get(client, "T10Y2Y",               api_key, 1),
+            fred_get(client, "UNRATE",               api_key, 1),
+            fred_get_safe(client, "ECBDFR",          api_key, 1),
             fred_get_safe(client, "CP0000EZ19M086NEST", api_key, 13),
-            fred_get_safe(client, "DEXUSEU",       api_key, 1),
+            fred_get_safe(client, "DEXUSEU",         api_key, 1),
         )
 
     # ── US Macro ──────────────────────────────────────────────────────────────
-    cpi_now = float(cpi[0]["value"])
-    cpi_ago = float(cpi[min(12, len(cpi)-1)]["value"])
-    cpi_yoy = round((cpi_now / cpi_ago - 1) * 100, 2)
-    fed_r     = float(fed[0]["value"])
-    consumer_v = float(consumer[0]["value"])
-    yld_v     = float(yld[0]["value"])
-    unemp_v   = float(unemp[0]["value"])
+    cpi_now  = float(cpi[0]["value"])
+    cpi_ago  = float(cpi[min(12, len(cpi)-1)]["value"])
+    cpi_yoy  = round((cpi_now / cpi_ago - 1) * 100, 2)
+    fed_r    = float(fed[0]["value"])
+    cons_v   = float(consumer[0]["value"])
+    yld_v    = float(yld[0]["value"])
+    unemp_v  = float(unemp[0]["value"])
 
-    s_us1 = score_cpi(cpi_yoy)
-    s_us2 = score_fed(fed_r)
-    s_us3 = score_consumer(consumer_v)
-    s_us4 = score_yield(yld_v)
-    s_us5 = score_unemp(unemp_v)
-    us_macro_score = round((s_us1+s_us2+s_us3+s_us4+s_us5) / 5)
+    s1 = score_cpi_dca(cpi_yoy)
+    s2 = score_fed_dca(fed_r)
+    s3 = score_consumer_dca(cons_v)
+    s4 = score_yield_dca(yld_v)
+    s5 = score_unemp_dca(unemp_v)
+
+    # Dot Plot se fornito
+    dot_score = None
+    dot_signal = None
+    if dot_plot_median is not None:
+        dot_score = score_dot_plot_dca(dot_plot_median, fed_r)
+        cuts_bp = round((fed_r - dot_plot_median) * 100)
+        dot_signal = {
+            "name": "Dot Plot (mediana Fed)",
+            "val": f"{dot_plot_median}%",
+            "score": dot_score,
+            "badge": badge_opp(dot_score),
+            "label": f"{'+' if cuts_bp >= 0 else ''}{cuts_bp}bp tagli attesi",
+        }
+        us_scores = [s1, s2, s3, s4, s5, dot_score]
+    else:
+        us_scores = [s1, s2, s3, s4, s5]
+
+    us_macro_score = round(sum(us_scores) / len(us_scores))
 
     us_signals = [
-        {"name":"CPI YoY (US)",       "val":f"{cpi_yoy}%",      "score":s_us1, "badge":badge(s_us1), "label":"CRITICO" if cpi_yoy>4 else "SOPRA TARGET" if cpi_yoy>3 else "MODERATO" if cpi_yoy>2 else "TARGET"},
-        {"name":"Fed Funds Rate",     "val":f"{fed_r}%",        "score":s_us2, "badge":badge(s_us2), "label":"MOLTO RESTR." if fed_r>5 else "RESTRITTIVO" if fed_r>4 else "NEUTRO"},
-        {"name":"Consumer Sentiment", "val":str(consumer_v),    "score":s_us3, "badge":badge(s_us3), "label":"PESSIMISMO" if consumer_v<60 else "CAUTELA" if consumer_v<75 else "NEUTRO" if consumer_v<90 else "OTTIMISMO"},
-        {"name":"Yield 10Y−2Y",      "val":f"{yld_v:+}%",      "score":s_us4, "badge":badge(s_us4), "label":"INVERSIONE" if yld_v<-0.2 else "PIATTA" if yld_v<0 else "NORMALE"},
-        {"name":"Disoccupaz. (US)",   "val":f"{unemp_v}%",      "score":s_us5, "badge":badge(s_us5), "label":"IN AUMENTO" if unemp_v>5 else "SOLIDA"},
+        {"name":"CPI YoY (US)",       "val":f"{cpi_yoy}%",   "score":s1, "badge":badge_opp(s1), "label":"INFLAZ. ALTA" if cpi_yoy>4 else "SOPRA TARGET" if cpi_yoy>3 else "MODERATA" if cpi_yoy>2 else "✓ SOTTO TARGET"},
+        {"name":"Fed Funds Rate",     "val":f"{fed_r}%",     "score":s2, "badge":badge_opp(s2), "label":"MOLTO RESTR." if fed_r>5 else "RESTRITTIVO" if fed_r>4 else "NEUTRO" if fed_r>2.5 else "✓ ACCOMODANTE"},
+        {"name":"Consumer Sentiment", "val":str(cons_v),     "score":s3, "badge":badge_opp(s3), "label":"✓ PESSIMISMO" if cons_v<60 else "✓ CAUTELA" if cons_v<75 else "NEUTRO" if cons_v<90 else "EUFORIA"},
+        {"name":"Yield 10Y−2Y",      "val":f"{yld_v:+}%",   "score":s4, "badge":badge_opp(s4), "label":"✓ INVERSIONE" if yld_v<-0.2 else "PIATTA" if yld_v<0 else "NORMALE"},
+        {"name":"Disoccupaz. (US)",   "val":f"{unemp_v}%",   "score":s5, "badge":badge_opp(s5), "label":"IN AUMENTO" if unemp_v>5 else "STABILE"},
     ]
+    if dot_signal:
+        us_signals.append(dot_signal)
 
     # ── EU Macro ──────────────────────────────────────────────────────────────
     eu_signals = []
@@ -107,119 +188,92 @@ async def fred_data(api_key: str = Query(...)):
 
     if ecb:
         ecb_r = float(ecb[0]["value"])
-        s = score_ecb(ecb_r)
+        s = score_ecb_dca(ecb_r)
         eu_scores.append(s)
-        eu_signals.append({"name":"BCE Deposit Rate", "val":f"{ecb_r}%", "score":s, "badge":badge(s), "label":"MOLTO RESTR." if ecb_r>4 else "RESTRITTIVO" if ecb_r>3 else "NEUTRO"})
+        eu_signals.append({"name":"BCE Deposit Rate","val":f"{ecb_r}%","score":s,"badge":badge_opp(s),"label":"RESTRITTIVO" if ecb_r>3 else "NEUTRO" if ecb_r>2 else "✓ ACCOMODANTE"})
 
     if eu_cpi_obs and len(eu_cpi_obs) >= 2:
         eu_now = float(eu_cpi_obs[0]["value"])
         eu_ago = float(eu_cpi_obs[min(12, len(eu_cpi_obs)-1)]["value"])
         eu_yoy = round((eu_now / eu_ago - 1) * 100, 2)
-        s = score_eu_cpi(eu_yoy)
+        s = score_eu_cpi_dca(eu_yoy)
         eu_scores.append(s)
-        eu_signals.append({"name":"HICP YoY (EU)", "val":f"{eu_yoy}%", "score":s, "badge":badge(s), "label":"CRITICO" if eu_yoy>4 else "SOPRA TARGET" if eu_yoy>3 else "MODERATO" if eu_yoy>2 else "TARGET"})
+        eu_signals.append({"name":"HICP YoY (EU)","val":f"{eu_yoy}%","score":s,"badge":badge_opp(s),"label":"ALTA" if eu_yoy>4 else "SOPRA TARGET" if eu_yoy>3 else "MODERATA" if eu_yoy>2 else "✓ TARGET"})
 
     if eurusd_obs:
         eurusd = float(eurusd_obs[0]["value"])
-        s = score_eurusd(eurusd)
+        s = score_eurusd_dca(eurusd)
         eu_scores.append(s)
-        eu_signals.append({"name":"EUR/USD", "val":f"{eurusd:.4f}", "score":s, "badge":badge(s), "label":"USD FORTE" if eurusd<1.05 else "NEUTRO" if eurusd<1.15 else "EUR FORTE"})
+        eu_signals.append({"name":"EUR/USD","val":f"{eurusd:.4f}","score":s,"badge":badge_opp(s),"label":"✓ EUR DEBOLE" if eurusd<1.05 else "NEUTRO" if eurusd<1.15 else "EUR FORTE"})
 
     eu_macro_score = round(sum(eu_scores) / len(eu_scores)) if eu_scores else 50
-
-    # ── Score aggregato (50% US / 50% EU) ────────────────────────────────────
     macro_score = round((us_macro_score + eu_macro_score) / 2)
 
     return {
-        "macro_score": macro_score,
+        "macro_score":    macro_score,
         "us_macro_score": us_macro_score,
         "eu_macro_score": eu_macro_score,
-        "signals": us_signals,
-        "eu_signals": eu_signals,
+        "signals":        us_signals,
+        "eu_signals":     eu_signals,
+        "dot_plot_score": dot_score,
     }
 
-# ─── NEWS API ─────────────────────────────────────────────────────────────────
+# ─── NEWS & CONSULTING ────────────────────────────────────────────────────────
 NEWS_QUERIES = [
-    "S&P500 stock market correction",
-    "Federal Reserve interest rates economy",
+    "S&P500 stock market selloff correction",
+    "Federal Reserve rate cut pivot",
     "geopolitical risk financial markets",
     "inflation recession GDP global",
-    "European stocks ECB economy",
-    "emerging markets risk selloff",
+    "European stocks ECB rate cut",
+    "emerging markets undervalued opportunity",
 ]
 
 CONSULTING_QUERIES = [
-    "Goldman Sachs market outlook forecast 2025",
-    "Morgan Stanley investment strategy equities",
-    "JPMorgan market view recession risk",
-    "BlackRock investment outlook allocation",
-    "Citi UBS market forecast correction",
-    "Deutsche Bank BNP Paribas European outlook",
+    "Goldman Sachs market outlook buy opportunity 2025",
+    "Morgan Stanley equities undervalued correction",
+    "JPMorgan market recovery entry point",
+    "BlackRock allocation opportunity emerging markets",
+    "Citi UBS European stocks cheap valuation",
+    "Deutsche Bank BNP Paribas European opportunity",
 ]
+
+async def _fetch_headlines(queries, api_key, page_size=5, max_results=30):
+    headlines, seen = [], set()
+    async with httpx.AsyncClient() as client:
+        responses = await asyncio.gather(*[
+            client.get(f"{NEWS_BASE}?q={q}&language=en&sortBy=publishedAt&pageSize={page_size}&apiKey={api_key}", timeout=15)
+            for q in queries
+        ], return_exceptions=True)
+    for resp in responses:
+        if isinstance(resp, Exception): continue
+        try:
+            data = resp.json()
+            if data.get("status") != "ok": continue
+            for a in data.get("articles", []):
+                title = a.get("title","").strip()
+                desc  = a.get("description","").strip()
+                if not title or title in seen: continue
+                seen.add(title)
+                headlines.append(f"• {title}: {desc}" if desc else f"• {title}")
+        except Exception: continue
+    return headlines[:max_results]
 
 @app.get("/api/news")
 async def get_news(api_key: str = Query(...)):
-    headlines = []
-    seen_titles = set()
-    async with httpx.AsyncClient() as client:
-        responses = await asyncio.gather(*[
-            client.get(f"{NEWS_BASE}?q={q}&language=en&sortBy=publishedAt&pageSize=5&apiKey={api_key}", timeout=15)
-            for q in NEWS_QUERIES
-        ], return_exceptions=True)
-    for resp in responses:
-        if isinstance(resp, Exception): continue
-        try:
-            data = resp.json()
-            if data.get("status") != "ok": continue
-            for a in data.get("articles", []):
-                title = a.get("title","").strip()
-                desc  = a.get("description","").strip()
-                if not title or title in seen_titles: continue
-                seen_titles.add(title)
-                headlines.append(f"• {title}: {desc}" if desc else f"• {title}")
-        except Exception: continue
-    if not headlines:
-        raise HTTPException(404, "Nessuna notizia trovata.")
-    text = "\n".join(headlines[:30])
-    return {"count": len(headlines[:30]), "text": text}
+    headlines = await _fetch_headlines(NEWS_QUERIES, api_key)
+    if not headlines: raise HTTPException(404, "Nessuna notizia trovata.")
+    return {"count": len(headlines), "text": "\n".join(headlines)}
 
 @app.get("/api/consulting-news")
 async def get_consulting_news(api_key: str = Query(...)):
-    headlines = []
-    seen_titles = set()
-    async with httpx.AsyncClient() as client:
-        responses = await asyncio.gather(*[
-            client.get(f"{NEWS_BASE}?q={q}&language=en&sortBy=publishedAt&pageSize=4&apiKey={api_key}", timeout=15)
-            for q in CONSULTING_QUERIES
-        ], return_exceptions=True)
-    for resp in responses:
-        if isinstance(resp, Exception): continue
-        try:
-            data = resp.json()
-            if data.get("status") != "ok": continue
-            for a in data.get("articles", []):
-                title = a.get("title","").strip()
-                desc  = a.get("description","").strip()
-                if not title or title in seen_titles: continue
-                seen_titles.add(title)
-                headlines.append(f"• {title}: {desc}" if desc else f"• {title}")
-        except Exception: continue
-    if not headlines:
-        raise HTTPException(404, "Nessuna opinione trovata.")
-    text = "\n".join(headlines[:25])
-    return {"count": len(headlines[:25]), "text": text}
+    headlines = await _fetch_headlines(CONSULTING_QUERIES, api_key, page_size=4, max_results=25)
+    if not headlines: raise HTTPException(404, "Nessuna opinione trovata.")
+    return {"count": len(headlines), "text": "\n".join(headlines)}
 
-# ─── GROQ SENTIMENT ───────────────────────────────────────────────────────────
-def groq_score_to_level(score):
-    if score >= 76: return "CRITICO"
-    if score >= 56: return "ELEVATO"
-    if score >= 31: return "MEDIO"
-    return "BASSO"
-
+# ─── GROQ AI ──────────────────────────────────────────────────────────────────
 async def call_groq(system_prompt, user_content):
     groq_key = os.environ.get("GROQ_API_KEY")
-    if not groq_key:
-        raise HTTPException(500, "GROQ_API_KEY non configurata")
+    if not groq_key: raise HTTPException(500, "GROQ_API_KEY non configurata")
     async with httpx.AsyncClient() as client:
         r = await client.post(
             GROQ_BASE,
@@ -244,20 +298,32 @@ class SentimentPayload(BaseModel):
 
 @app.post("/api/sentiment")
 async def analyze_sentiment(payload: SentimentPayload):
-    system = """Sei un analista finanziario quantitativo specializzato in risk management globale.
-Analizza le notizie e assegna un sentiment_score dove:
-- 0-30 = notizie positive/neutre, mercati tranquilli, nessun rischio
-- 31-55 = notizie miste, qualche preoccupazione moderata
-- 56-75 = notizie negative, rischio correzione possibile
-- 76-100 = notizie molto negative, rischio correzione imminente
+    """
+    Analizza il sentiment delle notizie in ottica DCA/PAC.
+    Score alto = pessimismo/paura = opportunità di ingresso.
+    """
+    system = """Sei un analista finanziario specializzato in strategie DCA (Dollar Cost Averaging) a lungo termine.
+Analizza le notizie e assegna un opportunity_score dove:
+- 0-30 = notizie positive/euforiche, mercati cari, NON è buon momento per aumentare il PAC
+- 31-55 = notizie miste, mercato neutro, PAC ordinario
+- 56-75 = notizie negative/pessimistiche, mercato in correzione, BUONA opportunità per aumentare il PAC
+- 76-100 = notizie molto negative, panico, OTTIMA opportunità per massimizzare il PAC
 
-Considera sia i mercati USA che europei ed emergenti.
-Esempi: "mercati in rialzo, economia solida" → 15. "Fed + BCE alzano tassi, inflazione alta, tensioni geopolitiche" → 72. "crash mercati, recessione globale" → 92.
+Logica: il pessimismo e la paura sono segnali di opportunità per un investitore DCA a lungo termine.
+Esempi: "mercati in euforia, S&P500 ai massimi storici" → 15. "correzione mercati, timori recessione" → 68. "crash, panico, vendite massicce" → 90.
+
+Considera sia USA che Europa ed emergenti.
 
 Restituisci SOLO JSON:
-{"sentiment_score":<0-100>,"risk_level":"<BASSO|MEDIO|ELEVATO|CRITICO>","key_risks":["r1","r2","r3"],"summary":"<2 frasi IT>","recommended_action":"<1 frase IT>"}"""
+{"opportunity_score":<0-100>,"market_mood":"<EUFORIA|OTTIMISMO|NEUTRO|PESSIMISMO|PANICO>","key_opportunities":["opp1","opp2","opp3"],"summary":"<2 frasi IT>","dca_recommendation":"<1 frase IT su cosa fare con il PAC>"}"""
     result = await call_groq(system, f"Analizza:\n\n{payload.text}")
-    result["risk_level"] = groq_score_to_level(result.get("sentiment_score", 50))
+    # Normalizza il campo
+    score = result.get("opportunity_score", 50)
+    if score >= 76:   result["market_mood"] = "PANICO"
+    elif score >= 56: result["market_mood"] = "PESSIMISMO"
+    elif score >= 31: result["market_mood"] = "NEUTRO"
+    elif score >= 15: result["market_mood"] = "OTTIMISMO"
+    else:             result["market_mood"] = "EUFORIA"
     return result
 
 class ConsultingPayload(BaseModel):
@@ -265,24 +331,29 @@ class ConsultingPayload(BaseModel):
 
 @app.post("/api/consulting-sentiment")
 async def consulting_sentiment(payload: ConsultingPayload):
-    system = """Sei un analista che valuta le previsioni delle principali banche d'investimento globali.
-Assegna un consulting_score dove:
-- 0-30 = banche ottimiste, prevedono mercati rialzisti globali
-- 31-55 = previsioni miste, alcune cautele moderate
-- 56-75 = banche caute/pessimiste, segnalano rischi significativi
-- 76-100 = banche molto pessimiste, prevedono correzioni o recessione
+    """
+    Analizza le opinioni delle banche in ottica DCA.
+    Se le banche sono pessimiste = opportunità contrarian.
+    """
+    system = """Sei un analista che valuta le previsioni delle principali banche d'investimento in ottica DCA a lungo termine.
+Assegna un opportunity_score dove:
+- 0-30 = banche molto ottimiste, mercati cari, consensus rialzista → momento di cautela per il PAC
+- 31-55 = previsioni miste → PAC ordinario
+- 56-75 = banche caute/pessimiste → buona opportunità contrarian per il PAC
+- 76-100 = banche molto pessimiste, prevedono crolli → ottima opportunità contrarian
 
-Considera sia le previsioni sui mercati USA che europei ed emergenti.
-Esempi: "Goldman rialza target S&P500, positivo su Europa" → 20. "JPMorgan avverte recessione USA+EU" → 72.
+Logica: quando le grandi banche sono pessimiste, spesso è il momento migliore per investire progressivamente.
+Esempi: "Goldman prevede S&P500 a 7000, mercato rialzista" → 15. "JPMorgan taglia target, rischio recessione" → 68.
 
 Restituisci SOLO JSON:
-{"consulting_score":<0-100>,"outlook":"<RIALZISTA|NEUTRO|RIBASSISTA|MOLTO_RIBASSISTA>","key_views":["v1","v2","v3"],"summary":"<2 frasi IT>"}"""
+{"opportunity_score":<0-100>,"consensus":"<MOLTO_RIALZISTA|RIALZISTA|NEUTRO|RIBASSISTA|MOLTO_RIBASSISTA>","key_views":["v1","v2","v3"],"summary":"<2 frasi IT>","dca_signal":"<1 frase IT>"}"""
     result = await call_groq(system, f"Analizza:\n\n{payload.text}")
-    score = result.get("consulting_score", 50)
-    if score >= 76:   result["outlook"] = "MOLTO_RIBASSISTA"
-    elif score >= 56: result["outlook"] = "RIBASSISTA"
-    elif score >= 31: result["outlook"] = "NEUTRO"
-    else:             result["outlook"] = "RIALZISTA"
+    score = result.get("opportunity_score", 50)
+    if score >= 76:   result["consensus"] = "MOLTO_RIBASSISTA"
+    elif score >= 56: result["consensus"] = "RIBASSISTA"
+    elif score >= 31: result["consensus"] = "NEUTRO"
+    elif score >= 15: result["consensus"] = "RIALZISTA"
+    else:             result["consensus"] = "MOLTO_RIALZISTA"
     return result
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -296,26 +367,34 @@ class AlertPayload(BaseModel):
     trigger: str
     top_signals: list[str] = []
 
-def risk_emoji(s): return "🔴" if s>=75 else "🟡" if s>=60 else "🟢"
+def opp_emoji(s):
+    if s >= 76: return "🟢🟢"
+    if s >= 56: return "🟢"
+    if s >= 31: return "⚪"
+    return "🔴"
 
 def build_message(p):
-    emoji = risk_emoji(p.overall_score)
-    trigger_label = "⚠️ SOGLIA SUPERATA" if p.trigger=="threshold" else "🔄 Aggiornamento dati"
+    emoji = opp_emoji(p.overall_score)
+    trigger_label = "⚡ SEGNALE DCA" if p.trigger == "threshold" else "🔄 Aggiornamento"
+    if p.overall_score >= 76:
+        action = "🟢 OTTIMA OPPORTUNITÀ — Considera di massimizzare il PAC"
+    elif p.overall_score >= 56:
+        action = "🟡 BUONA OPPORTUNITÀ — Considera di incrementare il PAC"
+    elif p.overall_score >= 31:
+        action = "⚪ MERCATO NEUTRO — PAC ordinario come da piano"
+    else:
+        action = "🔴 MERCATO CARO — Riduci o sospendi nuovi ingressi"
+
     lines = [
-        f"{emoji} *MarketSentinel Alert*", f"_{trigger_label}_", "",
-        f"*Risk Score: {p.overall_score}/100*", "",
+        f"{emoji} *MarketSentinel DCA Signal*", f"_{trigger_label}_", "",
+        f"*Opportunity Score: {p.overall_score}/100*", "",
         f"• Tecnico:   {p.tech_score}",
         f"• Macro:     {p.macro_score}",
         f"• Sentiment: {p.sent_score}",
     ]
     if p.top_signals:
-        lines += ["", "*Segnali critici:*"] + [f"  ↳ {s}" for s in p.top_signals[:3]]
-    if p.overall_score >= 75:
-        lines += ["", "🚨 *Valutare riduzione esposizione azionaria*"]
-    elif p.overall_score >= 60:
-        lines += ["", "⚡ *Monitorare attentamente l'evoluzione*"]
-    else:
-        lines += ["", "✅ *Mercato stabile — nessuna azione richiesta*"]
+        lines += ["", "*Segnali chiave:*"] + [f"  ↳ {s}" for s in p.top_signals[:3]]
+    lines += ["", action]
     return "\n".join(lines)
 
 @app.post("/api/send-alert")
@@ -333,4 +412,4 @@ async def send_alert(payload: AlertPayload):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "6.0.0"}
